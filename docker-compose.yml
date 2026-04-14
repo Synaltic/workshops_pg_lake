@@ -1,0 +1,87 @@
+services:
+  pg_lake-postgres:
+    image: ghcr.io/synaltic/pg_lake:local-pg18-v3.2.2
+    pull_policy: if_not_present
+    container_name: pg_lake
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./scripts/entrypoint-postgres.sh:/entrypoint-postgres.sh
+      - ./scripts/init-postgres.sql:/init-postgres.sql
+      - pgduck-unix-socket-volume:/home/postgres/pgduck_socket_dir
+      - pg-shared-tmp-dir-volume:/home/postgres/pgsql-${PG_MAJOR:-18}/data/base/pgsql_tmp
+    entrypoint: ["/entrypoint-postgres.sh"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "psql", "-c", "create table test(a int) using iceberg; drop table test;"]
+      interval: 6s
+      timeout: 2s
+      start_period: 20s
+      retries: 3
+    cap_add:
+      - SYS_PTRACE
+    depends_on:
+      - pgduck-server
+
+  pgduck-server:
+    image: ghcr.io/synaltic/pgduck-server:local-pg18-v3.2.2
+    pull_policy: if_not_present
+    container_name: pgduck-server
+    # NOTE: pgduck-server only listens on Unix sockets, not TCP
+    # To access DuckDB from the host, connect via pg_lake-postgres container which shares the Unix socket
+    # Example: psql -h localhost -p 5432 -U postgres -c "SELECT * FROM duckdb_fdw.some_table"
+    # IMPORTANT: Both containers must share the same temp directory volume so pgduck_server can access temp files
+    volumes:
+      - ./scripts/entrypoint-pgduck-server.sh:/entrypoint-pgduck-server.sh
+      - ./scripts/init-pgduck-server.sql:/init-pgduck-server.sql
+      - pgduck-unix-socket-volume:/home/postgres/pgduck_socket_dir
+      - pg-shared-tmp-dir-volume:/home/postgres/pgsql-${PG_MAJOR:-18}/data/base/pgsql_tmp
+    entrypoint: ["/entrypoint-pgduck-server.sh"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "psql", "-p", "5332", "-h", "/home/postgres/pgduck_socket_dir", "-c", "SELECT 1;"]
+      interval: 6s
+      timeout: 2s
+      start_period: 20s
+      retries: 3
+    cap_add:
+      - SYS_PTRACE
+    depends_on:
+      - minio
+
+
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: minio-c360
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # Web Console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set minio http://minio:9000 minioadmin minioadmin &&
+        mc mb minio/testbucket --ignore-existing &&
+        echo 'Bucket testbucket created successfully'
+      "
+
+volumes:
+  pgduck-unix-socket-volume:
+  pg-shared-tmp-dir-volume:  # Shared temp directory for both PostgreSQL and pgduck_server
+  minio-data:
+
